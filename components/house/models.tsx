@@ -13,12 +13,13 @@
  * origin at floor level and the front facing +Z.
  *
  * The Draco decoder is served locally from /public/draco (no CDN).
+ * Model URLs should also start with process.env.NEXT_PUBLIC_BASE_PATH on GitHub Pages.
  */
 import { Suspense, useMemo } from "react";
 import { useGLTF } from "@react-three/drei";
 import { HOUSES, type FurnitureKey, type ModelAnchor } from "./buildHouseUnit";
 
-export const DRACO_DECODER_PATH = "/draco/";
+export const DRACO_DECODER_PATH = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/draco/`;
 
 export interface ModelConfig {
   url: string;
