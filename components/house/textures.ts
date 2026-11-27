@@ -1,8 +1,10 @@
 /**
- * Procedural PBR textures + shared material library.
- * Every texture is drawn on an HTML5 canvas at runtime, so the scene has
- * zero external image URLs. UVs in the scene are in FEET, so each texture's
- * `repeat` is set to 1 / (feet covered by one canvas).
+ * Shared material library.
+ * The main surfaces (floor tiles, wood, plaster, bathroom tiles) use real 1K
+ * PBR maps from Poly Haven (public/textures, see loadPbrTextures). Everything
+ * else, and the first frames before those load, uses textures drawn on a
+ * canvas at runtime. UVs in the scene are in FEET, so each texture's `repeat`
+ * is set to 1 / (feet covered by one image).
  */
 import * as THREE from "three";
 
@@ -365,6 +367,10 @@ export interface FinishPreset {
   floorBase: string;
   floorGrout: string;
   wood: string;
+  /** multiplies the real oak veneer photo texture */
+  woodTint: string;
+  /** multiplies the real floor tile photo texture */
+  floorTint: string;
   cabinet: string;
   sofa: string;
   swatch: [string, string];
@@ -378,6 +384,8 @@ export const FINISH_PRESETS: FinishPreset[] = [
     floorBase: "#ece2cf",
     floorGrout: "#cdbfa6",
     wood: "#8a5a2e",
+    woodTint: "#c4a184",
+    floorTint: "#ffffff",
     cabinet: "#efe6d6",
     sofa: "#b9a58b",
     swatch: ["#f3ead8", "#8a5a2e"],
@@ -389,6 +397,8 @@ export const FINISH_PRESETS: FinishPreset[] = [
     floorBase: "#cfcac2",
     floorGrout: "#a9a39a",
     wood: "#5b3d29",
+    woodTint: "#7d6250",
+    floorTint: "#d3cfca",
     cabinet: "#5f6266",
     sofa: "#7d7a76",
     swatch: ["#d9d2c7", "#5b3d29"],
@@ -400,6 +410,8 @@ export const FINISH_PRESETS: FinishPreset[] = [
     floorBase: "#e6e1d5",
     floorGrout: "#c3bcab",
     wood: "#b88d5c",
+    woodTint: "#fff1de",
+    floorTint: "#f3efe6",
     cabinet: "#9fb39a",
     sofa: "#8f9e86",
     swatch: ["#cfdac6", "#b88d5c"],
@@ -413,7 +425,7 @@ export const FINISH_PRESETS: FinishPreset[] = [
 export type MatKey =
   | "wall" | "ceiling" | "extLight" | "extAccent" | "cladding" | "plinth"
   | "floor" | "sitout" | "step" | "bathFloor" | "bathWall" | "backsplash" | "utilityFloor"
-  | "granite" | "wood" | "cabinet" | "sofa" | "cushion" | "rug" | "blanket" | "linen"
+  | "granite" | "wood" | "trim" | "cabinet" | "sofa" | "cushion" | "rug" | "blanket" | "linen"
   | "steel" | "blackMetal" | "frame" | "glass" | "mirror" | "porcelain" | "appliance" | "screen"
   | "curtain" | "pot" | "leaf" | "soil" | "tank" | "asphalt" | "grass" | "paver" | "concrete"
   | "marking" | "terrace" | "hob" | "tyre" | "scooter"
@@ -453,6 +465,8 @@ export function createMaterialLibrary(): MaterialLibrary {
     utilityFloor: std({ map: ceramicTiles("#a39a90", "#857c72", 1, 1, 44, false), roughness: 0.75 }),
     granite: std({ map: granite(), roughness: 0.18, metalness: 0.05 }),
     wood: std({ roughness: 0.55 }),
+    // door casings / frames: same wood, nudged toward the camera in the depth test
+    trim: std({ roughness: 0.5, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }),
     cabinet: std({ color: FINISH_PRESETS[0].cabinet, roughness: 0.35 }),
     sofa: std({ map: fabric("#ffffff"), color: FINISH_PRESETS[0].sofa, roughness: 0.95 }),
     cushion: std({ map: fabric("#c4733a", 13), roughness: 0.95 }),
@@ -501,6 +515,15 @@ export function applyFinishPreset(lib: MaterialLibrary, p: FinishPreset) {
   lib.wall.color.set(p.wall);
   lib.cabinet.color.set(p.cabinet);
   lib.sofa.color.set(p.sofa);
+  lib.floor.userData.preset = p;
+
+  // once the real photo textures are in, presets only re-tint them
+  if (lib.wood.userData.pbr) {
+    lib.wood.color.set(p.woodTint);
+    lib.trim.color.set(p.woodTint);
+    lib.floor.color.set(p.floorTint);
+    return;
+  }
 
   let wood = woodCache.get(p.wood);
   if (!wood) {
@@ -509,6 +532,8 @@ export function applyFinishPreset(lib: MaterialLibrary, p: FinishPreset) {
   }
   lib.wood.map = wood;
   lib.wood.needsUpdate = true;
+  lib.trim.map = wood;
+  lib.trim.needsUpdate = true;
 
   const fk = p.floorBase + p.floorGrout;
   let floor = floorCache.get(fk);
@@ -536,4 +561,65 @@ export function disposeMaterialLibrary(lib: MaterialLibrary) {
   seen.forEach((t) => {
     if (![...woodCache.values(), ...floorCache.values()].includes(t)) t.dispose();
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Real PBR maps (Poly Haven, CC0)                                     */
+/* ------------------------------------------------------------------ */
+
+interface PbrSet {
+  /** folder in /public holding diff.jpg, rough.jpg, nor.jpg */
+  dir: string;
+  /** real-world size of one image, in feet */
+  feet: number;
+  mats: MatKey[];
+  /** keep the existing colour map (plaster: paint colour comes from material.color) */
+  diffuse?: boolean;
+  roughness?: number;
+  normalScale?: number;
+}
+
+/**
+ * Loads the 1K diffuse/roughness/normal JPGs and swaps them onto the main
+ * materials. Uses THREE.DefaultLoadingManager, so the loading bar counts them.
+ * `url` turns a public path into a URL that works under the GitHub Pages sub-path.
+ */
+export function loadPbrTextures(lib: MaterialLibrary, url: (p: string) => string, maxAnisotropy: number) {
+  const loader = new THREE.TextureLoader();
+  const sets: PbrSet[] = [
+    { dir: "textures/floorTile", feet: 4.92, mats: ["floor"], roughness: 0.55, normalScale: 0.6 },
+    { dir: "textures/wood", feet: 6.0, mats: ["wood", "trim"], roughness: 0.9, normalScale: 0.5 },
+    // plaster: keep the light canvas colour map so paint swatches stay true; use the real relief + roughness
+    { dir: "textures/plaster", feet: 6.56, mats: ["wall", "ceiling", "extLight", "extAccent"], diffuse: false, roughness: 1, normalScale: 0.25 },
+    { dir: "textures/bathWall", feet: 4.17, mats: ["bathWall"], roughness: 0.6, normalScale: 0.8 },
+    { dir: "textures/bathFloor", feet: 5.9, mats: ["bathFloor"], roughness: 1, normalScale: 0.8 },
+  ];
+  const loaded: THREE.Texture[] = [];
+  const load = (path: string, srgb: boolean, feet: number) => {
+    const t = loader.load(url(path));
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(1 / feet, 1 / feet);
+    t.anisotropy = Math.min(8, maxAnisotropy);
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    loaded.push(t);
+    return t;
+  };
+  for (const s of sets) {
+    const diff = s.diffuse === false ? null : load(`${s.dir}/diff.jpg`, true, s.feet);
+    const rough = load(`${s.dir}/rough.jpg`, false, s.feet);
+    const nor = load(`${s.dir}/nor.jpg`, false, s.feet);
+    for (const k of s.mats) {
+      const m = lib[k];
+      if (diff) m.map = diff;
+      m.roughnessMap = rough;
+      m.roughness = s.roughness ?? 1;
+      m.normalMap = nor;
+      m.normalScale.setScalar(s.normalScale ?? 1);
+      m.userData.pbr = true;
+      m.needsUpdate = true;
+    }
+  }
+  const p = lib.floor.userData.preset as FinishPreset | undefined;
+  if (p) applyFinishPreset(lib, p);
+  return () => loaded.forEach((t) => t.dispose());
 }

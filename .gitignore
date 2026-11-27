@@ -3,3 +3,7 @@ node_modules
 out
 *.tsbuildinfo
 next-env.d.ts
+
+# keep the site assets even though the global ignore file excludes "Public/"
+!/public/
+!/public/**

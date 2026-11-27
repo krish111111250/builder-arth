@@ -15,11 +15,12 @@ const PROJECT_TITLE = "3-Unit 1BHK Row House 3D Plan";
 
 /* ================================================================== */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import * as THREE from "three";
-import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber";
-import { Html, OrbitControls } from "@react-three/drei";
+import { Canvas, useFrame, useLoader, useThree, type ThreeEvent } from "@react-three/fiber";
+import { Html, OrbitControls, useProgress } from "@react-three/drei";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import {
   applyFinishPreset,
@@ -27,6 +28,7 @@ import {
   createMaterialLibrary,
   disposeMaterialLibrary,
   FINISH_PRESETS,
+  loadPbrTextures,
   setMaxAnisotropy,
   type FinishPresetId,
   type MaterialLibrary,
@@ -48,7 +50,9 @@ import {
   type DoorDef,
 } from "./buildHouseUnit";
 import WalkControls, { walkInput, type WalkTarget } from "./WalkControls";
-import { FurnitureModels, MODEL_KEYS } from "./models";
+import { FurnitureModels } from "./models";
+import { disposeProceduralTemplates } from "./proceduralAssets";
+import { HDRI_URLS, publicUrl } from "../../src/config/assetManifest";
 
 type Mode = "walk" | "orbit";
 type Lighting = "evening" | "day";
@@ -83,37 +87,77 @@ function spawnFor(i: number, nonce: number): WalkTarget {
 }
 
 const LIGHTING = {
-  day: { bg: "#bcd3e6", hemi: 1.0, sky: "#e3f0ff", groundCol: "#7d6a52", sun: 3.0, sunCol: "#fff3e0", sunPos: [40, 70, 50] as const, env: 0.55, interior: 7, interiorCol: "#fff6ec", porch: 0, exposure: 1.0 },
-  evening: { bg: "#1a2131", hemi: 0.22, sky: "#4a5b84", groundCol: "#2a2018", sun: 0.45, sunCol: "#ff9a5c", sunPos: [-55, 16, 45] as const, env: 0.1, interior: 42, interiorCol: "#ffb978", porch: 30, exposure: 1.15 },
+  day: { bg: "#bcd3e6", hemi: 0.8, sky: "#e3f0ff", groundCol: "#7d6a52", sun: 3.0, sunCol: "#fff3e0", sunPos: [40, 70, 50] as const, env: 0.5, bgIntensity: 0.9, interior: 12, interiorCol: "#fff6ec", porch: 0, exposure: 1.0 },
+  evening: { bg: "#1a2131", hemi: 0.18, sky: "#4a5b84", groundCol: "#2a2018", sun: 0.45, sunCol: "#ff9a5c", sunPos: [-55, 16, 45] as const, env: 0.12, bgIntensity: 0.55, interior: 42, interiorCol: "#ffb978", porch: 30, exposure: 1.15 },
 };
 
 /* ================================================================== */
 /* 3D pieces                                                           */
 /* ================================================================== */
 
+/** Tone mapping, fog and env strength for the current mode. */
 function EnvironmentSetup({ lighting }: { lighting: Lighting }) {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  useEffect(() => {
+    const L = LIGHTING[lighting];
+    scene.environmentIntensity = L.env;
+    scene.backgroundIntensity = L.bgIntensity;
+    scene.fog = new THREE.Fog(L.bg, 160, 380);
+    gl.toneMapping = THREE.ACESFilmicToneMapping;
+    gl.toneMappingExposure = L.exposure;
+  }, [lighting, scene, gl]);
+  return null;
+}
+
+/** Shown until the HDRIs arrive: a generated studio env map and a flat sky colour. */
+function FallbackEnvironment({ lighting }: { lighting: Lighting }) {
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
   useEffect(() => {
     const pmrem = new THREE.PMREMGenerator(gl);
     const room = new RoomEnvironment();
     const rt = pmrem.fromScene(room, 0.04);
+    const bg = new THREE.Color(LIGHTING[lighting].bg);
     scene.environment = rt.texture;
+    scene.background = bg;
     return () => {
-      scene.environment = null;
+      // the HDRI may already have replaced these; only clear what is still ours
+      if (scene.environment === rt.texture) scene.environment = null;
+      if (scene.background === bg) scene.background = null;
       rt.dispose();
       pmrem.dispose();
       room.traverse((o) => (o as THREE.Mesh).geometry?.dispose());
     };
-  }, [gl, scene]);
+  }, [gl, scene, lighting]);
+  return null;
+}
+
+/**
+ * Real sky HDRIs (Poly Haven, 1K): bright midday and warm dusk.
+ * RGBELoader loads them, PMREMGenerator turns them into blurred reflection
+ * maps for glass, tiles, steel and the TV screen; the raw HDRI is the sky.
+ */
+function HdriEnvironment({ lighting }: { lighting: Lighting }) {
+  const gl = useThree((s) => s.gl);
+  const scene = useThree((s) => s.scene);
+  const [day, evening] = useLoader(RGBELoader, [HDRI_URLS.day, HDRI_URLS.evening]);
+  const env = useMemo(() => {
+    const pmrem = new THREE.PMREMGenerator(gl);
+    const out = { day: pmrem.fromEquirectangular(day), evening: pmrem.fromEquirectangular(evening) };
+    pmrem.dispose();
+    day.mapping = THREE.EquirectangularReflectionMapping;
+    evening.mapping = THREE.EquirectangularReflectionMapping;
+    return out;
+  }, [gl, day, evening]);
+  useEffect(() => () => {
+    env.day.dispose();
+    env.evening.dispose();
+  }, [env]);
   useEffect(() => {
-    const L = LIGHTING[lighting];
-    scene.environmentIntensity = L.env;
-    scene.background = new THREE.Color(L.bg);
-    scene.fog = new THREE.Fog(L.bg, 140, 360);
-    gl.toneMapping = THREE.ACESFilmicToneMapping;
-    gl.toneMappingExposure = L.exposure;
-  }, [lighting, scene, gl]);
+    scene.environment = env[lighting].texture;
+    scene.background = lighting === "day" ? day : evening;
+  }, [lighting, env, scene, day, evening]);
   return null;
 }
 
@@ -146,8 +190,8 @@ function Sun({ lighting, mobile }: { lighting: Lighting; mobile: boolean }) {
         castShadow
         shadow-mapSize-width={size}
         shadow-mapSize-height={size}
-        shadow-bias={-0.0004}
-        shadow-normalBias={0.06}
+        shadow-bias={-0.0005}
+        shadow-normalBias={0.02}
       />
     </>
   );
@@ -166,35 +210,6 @@ function InteriorLights({ built, house, lighting }: { built: BuiltScene; house: 
       <pointLight position={p.bath} intensity={L.interior * 0.45} {...common} />
       <pointLight position={p.porch} intensity={L.porch} decay={2} distance={20} color="#ffb76a" />
     </>
-  );
-}
-
-function Fan({ position, lib }: { position: THREE.Vector3; lib: MaterialLibrary }) {
-  const rotor = useRef<THREE.Group>(null);
-  useFrame((_, dt) => {
-    if (rotor.current) rotor.current.rotation.y += Math.min(dt, 0.05) * 5;
-  });
-  return (
-    <group position={position}>
-      <mesh position={[0, -0.45, 0]} material={lib.steel}>
-        <cylinderGeometry args={[0.05, 0.05, 0.9, 8]} />
-      </mesh>
-      <mesh position={[0, -0.05, 0]} material={lib.steel}>
-        <cylinderGeometry args={[0.25, 0.25, 0.1, 16]} />
-      </mesh>
-      <group ref={rotor} position={[0, -1.05, 0]}>
-        <mesh material={lib.blackMetal} castShadow>
-          <cylinderGeometry args={[0.38, 0.32, 0.32, 20]} />
-        </mesh>
-        {[0, 1, 2].map((b) => (
-          <group key={b} rotation={[0, (b * Math.PI * 2) / 3, 0]}>
-            <mesh position={[1.35, 0.02, 0]} rotation={[0.08, 0, 0]} material={lib.wood} castShadow>
-              <boxGeometry args={[2.1, 0.04, 0.42]} />
-            </mesh>
-          </group>
-        ))}
-      </group>
-    </group>
   );
 }
 
@@ -380,12 +395,16 @@ function Scene(p: SceneProps) {
     setMaxAnisotropy(gl.capabilities.getMaxAnisotropy());
     return createMaterialLibrary();
   }, [gl]);
-  const built = useMemo(() => buildRowHouses(lib, MODEL_KEYS), [lib]);
+  const built = useMemo(() => buildRowHouses(lib), [lib]);
 
   useEffect(() => () => {
     built.dispose();
+    disposeProceduralTemplates(lib);
     disposeMaterialLibrary(lib);
   }, [built, lib]);
+
+  // real Poly Haven floor/wood/plaster/tile maps replace the canvas textures once loaded
+  useEffect(() => loadPbrTextures(lib, publicUrl, gl.capabilities.getMaxAnisotropy()), [lib, gl]);
 
   useEffect(() => {
     const preset = FINISH_PRESETS.find((f) => f.id === p.presetId) ?? FINISH_PRESETS[0];
@@ -408,6 +427,9 @@ function Scene(p: SceneProps) {
     <>
       <ReadySignal onReady={p.onReady} />
       <EnvironmentSetup lighting={p.lighting} />
+      <Suspense fallback={<FallbackEnvironment lighting={p.lighting} />}>
+        <HdriEnvironment lighting={p.lighting} />
+      </Suspense>
       <CameraLens mode={p.mode} />
       <Sun lighting={p.lighting} mobile={p.mobile} />
       <InteriorLights built={built} house={p.house} lighting={p.lighting} />
@@ -416,11 +438,10 @@ function Scene(p: SceneProps) {
       <primitive object={built.main} />
       <primitive object={built.roof} visible={roofVisible} />
 
-      {roofVisible && built.fans.map((f, i) => <Fan key={i} position={f} lib={lib} />)}
       {built.doors.map((d, i) => (
         <MainDoor key={i} def={d} lib={lib} open={p.doorsOpen[i]} onToggle={() => p.toggleDoor(i)} />
       ))}
-      <FurnitureModels anchors={built.anchors} />
+      <FurnitureModels anchors={built.anchors} lib={lib} roofVisible={roofVisible} />
 
       {p.mode === "walk" &&
         ROOMS.map((r) => {
@@ -584,6 +605,55 @@ function useIsTouch() {
   return touch;
 }
 
+/**
+ * Full-screen loader with a real progress bar. Tracks every model, texture and
+ * HDRI through THREE.DefaultLoadingManager and fades out once the first frame
+ * is drawn and everything has arrived (or after 30 s, so a slow file never
+ * blocks the tour).
+ */
+function LoadingOverlay({ sceneReady }: { sceneReady: boolean }) {
+  const { progress, active, loaded, total } = useProgress();
+  const [done, setDone] = useState(false);
+  const [fading, setFading] = useState(false);
+  const finished = sceneReady && !active && total > 0 && loaded >= total;
+
+  useEffect(() => {
+    const t = setTimeout(() => setFading(true), 30000);
+    return () => clearTimeout(t);
+  }, []);
+  useEffect(() => {
+    if (!finished) return;
+    const t = setTimeout(() => setFading(true), 250);
+    return () => clearTimeout(t);
+  }, [finished]);
+  useEffect(() => {
+    if (!fading) return;
+    const t = setTimeout(() => setDone(true), 600);
+    return () => clearTimeout(t);
+  }, [fading]);
+
+  if (done) return null;
+  const pct = sceneReady ? Math.round(total > 0 ? progress : 0) : 0;
+  return (
+    <div
+      className={`absolute inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-[#0f1115] px-8 text-white/85 transition-opacity duration-500 ${fading ? "pointer-events-none opacity-0" : "opacity-100"}`}
+      role="progressbar"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={pct}
+      aria-label="Loading the 3D tour"
+    >
+      <p className="text-sm font-semibold tracking-wide">{PROJECT_TITLE}</p>
+      <div className="h-1.5 w-full max-w-xs overflow-hidden rounded-full bg-white/10">
+        <div className="h-full rounded-full bg-amber-400 transition-[width] duration-300 ease-out" style={{ width: `${Math.max(4, pct)}%` }} />
+      </div>
+      <p className="text-xs text-white/60">
+        {!sceneReady ? "Building the 3 houses…" : `Loading furniture, textures and lighting… ${pct}%`}
+      </p>
+    </div>
+  );
+}
+
 /* ================================================================== */
 /* Main component                                                      */
 /* ================================================================== */
@@ -698,12 +768,7 @@ export default function HouseShowcase() {
         />
       </Canvas>
 
-      {!ready && (
-        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-[#0f1115] text-white/80">
-          <div className="h-9 w-9 animate-spin rounded-full border-2 border-white/20 border-t-amber-400" />
-          <p className="text-sm tracking-wide">Building the 3 houses…</p>
-        </div>
-      )}
+      <LoadingOverlay sceneReady={ready} />
 
       {/* ---------- Top bar ---------- */}
       <div className="pointer-events-none absolute inset-x-0 top-0 flex flex-col items-center gap-2 p-3 sm:p-4" style={{ paddingTop: "max(12px, env(safe-area-inset-top))" }}>

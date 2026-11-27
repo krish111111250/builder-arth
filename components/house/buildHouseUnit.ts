@@ -11,13 +11,15 @@
  * plumbing wall on the x = -7.5 party wall.
  *
  * All static meshes are merged per material (a few dozen draw calls in total).
- * Furniture is tagged by a key so it can be skipped and replaced by a GLB model
- * at the matching anchor (see models.tsx).
+ * Furniture and fixtures are not built here: each one is a placement (anchor)
+ * with a target size, filled by a .glb from the asset manifest or a curved
+ * procedural fallback (see components/house/models.tsx).
  */
 import * as THREE from "three";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import type { MatKey, MaterialLibrary } from "./textures";
 import { aabbFromRange, type AABB, type CollisionWorld } from "./collision";
+import type { AssetKey } from "../../src/config/assetManifest";
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -290,14 +292,22 @@ export interface DoorDef {
   closedBox: AABB;
 }
 
+/** One furniture / fixture placement. The model is fitted into size = [width, depth, height] ft. */
 export interface ModelAnchor {
   house: number;
-  key: FurnitureKey;
+  key: AssetKey;
+  /** centre of the target box at floor level (or at the ceiling for hanging items) */
   position: THREE.Vector3;
   rotationY: number;
+  mirror: boolean;
+  size: [number, number, number];
+  align: "center" | "back";
+  vAlign: "bottom" | "top";
+  contactShadow: boolean;
+  /** ceiling-hung items are hidden in the open-roof cutaway */
+  hideWithRoof: boolean;
+  spin: boolean;
 }
-
-export type FurnitureKey = "sofa" | "coffeeTable" | "tvUnit" | "bed" | "wardrobe" | "fridge" | "washingMachine" | "toilet" | "scooter";
 
 export interface HouseLights {
   living: THREE.Vector3;
@@ -313,7 +323,6 @@ export interface BuiltScene {
   ground: THREE.Mesh;
   collision: CollisionWorld;
   doors: DoorDef[];
-  fans: THREE.Vector3[];
   anchors: ModelAnchor[];
   lights: HouseLights[];
   dispose: () => void;
@@ -328,14 +337,12 @@ interface UnitCtx {
   roof: Kit;
   boxes: AABB[];
   doors: DoorDef[];
-  fans: THREE.Vector3[];
   anchors: ModelAnchor[];
   lights: HouseLights[];
-  skip: Set<FurnitureKey>;
 }
 
 export function buildHouseUnit(i: number, ctx: UnitCtx) {
-  const { main, roof, boxes, skip } = ctx;
+  const { main, roof, boxes } = ctx;
   const mirror = HOUSES[i].mirror;
   const ox = unitOriginX(i);
   const X = (lx: number) => (mirror ? ox + UNIT_W - lx : ox + lx);
@@ -418,7 +425,8 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
     B("frame", a, b, y1, y1 + ft, dc - 0.12, dc + 0.12);
     B("frame", (a + b) / 2 - 0.06, (a + b) / 2 + 0.06, y1, y2, dc - 0.1, dc + 0.1);
     B("glass", a + ft, b - ft, y1 + ft, y2 - ft, dc - 0.02, dc + 0.02);
-    B("granite", a - 0.2, b + 0.2, y1 - 0.08, y1, dc - t / 2 - 0.18, dc + t / 2 + 0.18);
+    // sill top sits 0.04 ft above the wall's sill face (no shared plane = no flicker)
+    B("granite", a - 0.2, b + 0.2, y1 - 0.08, y1 + 0.04, dc - t / 2 - 0.18, dc + t / 2 + 0.18);
     if (opts.curtainD !== undefined) {
       const cb = F + (opts.curtainBottom ?? 0.25);
       const cd = opts.curtainD;
@@ -433,27 +441,63 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
     }
   };
 
-  /** Wooden door frame for an opening in a wall along local x. */
+  /**
+   * Wooden door frame (casing + jamb lining) for an opening in a wall along local x.
+   * The casing stands 0.06 ft proud of both wall faces and the jamb lines the
+   * reveal by REVEAL ft, so no frame face ever lies in a wall plane (no z-fighting).
+   */
+  const REVEAL = 0.05;
   const doorFrameLX = (dc: number, t: number, a: number, b: number, head: number) => {
     const fw = 0.22;
     const half = t / 2 + 0.06;
-    B("wood", a - fw, a, F, F + head + fw, dc - half, dc + half);
-    B("wood", b, b + fw, F, F + head + fw, dc - half, dc + half);
-    B("wood", a - fw, b + fw, F + head, F + head + fw, dc - half, dc + half);
+    B("trim", a - fw, a + REVEAL, F, F + head + fw, dc - half, dc + half);
+    B("trim", b - REVEAL, b + fw, F, F + head + fw, dc - half, dc + half);
+    B("trim", a - fw, b + fw, F + head - REVEAL, F + head + fw, dc - half, dc + half);
   };
   const doorFrameLD = (lc: number, t: number, a: number, b: number, head: number) => {
     const fw = 0.22;
     const half = t / 2 + 0.06;
-    B("wood", lc - half, lc + half, F, F + head + fw, a - fw, a);
-    B("wood", lc - half, lc + half, F, F + head + fw, b, b + fw);
-    B("wood", lc - half, lc + half, F + head, F + head + fw, a - fw, b + fw);
+    B("trim", lc - half, lc + half, F, F + head + fw, a - fw, a + REVEAL);
+    B("trim", lc - half, lc + half, F, F + head + fw, b - REVEAL, b + fw);
+    B("trim", lc - half, lc + half, F + head - REVEAL, F + head + fw, a - fw, b + fw);
   };
 
-  const anchor = (key: FurnitureKey, lx: number, d: number, faceLx: number, faceD: number) => {
+  /**
+   * Furniture placement. (lx, d) is the centre of the target box, y the floor
+   * (or ceiling for vAlign "top"), (faceLx, faceD) the direction the front faces.
+   */
+  const place = (
+    key: AssetKey,
+    lx: number,
+    d: number,
+    y: number,
+    faceLx: number,
+    faceD: number,
+    size: [number, number, number],
+    opts: { align?: "center" | "back"; vAlign?: "bottom" | "top"; shadow?: boolean; spin?: boolean } = {},
+  ) => {
     const wx = mirror ? -faceLx : faceLx;
     const wz = -faceD;
-    ctx.anchors.push({ house: i, key, position: V(lx, F, d), rotationY: Math.atan2(wx, wz) });
+    const vAlign = opts.vAlign ?? "bottom";
+    ctx.anchors.push({
+      house: i,
+      key,
+      position: V(lx, y, d),
+      rotationY: Math.atan2(wx, wz),
+      mirror,
+      size,
+      align: opts.align ?? "center",
+      vAlign,
+      contactShadow: opts.shadow ?? vAlign === "bottom",
+      hideWithRoof: vAlign === "top",
+      spin: opts.spin ?? false,
+    });
   };
+  // finished floor levels (tile tops), so models sit flush and never sink
+  const FL = F + 0.03;
+  const FL_BATH = F + 0.05;
+  const FL_OUT = F + 0.04;
+  const FL_RUG = F + 0.06;
 
   /* ---------------- Floors ---------------- */
   B("floor", 0.375, 14.625, F, F + 0.03, 5.75, 31);
@@ -468,8 +512,10 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
     { a: 1.5, b: 6.0, sill: 3, head: 7 },
     { a: 10.9, b: 13.9, sill: 0, head: 7 },
   ], "extLight", "wall");
-  // stone cladding feature around the main door
-  B("cladding", 9.9, 14.625, F, F + CEIL_H, 4.94, 5.0);
+  // stone cladding feature around the main door (cut around the door casing)
+  B("cladding", 9.9, 10.9 - 0.22, F, F + CEIL_H, 4.94, 5.0);
+  B("cladding", 13.9 + 0.22, 14.625, F, F + CEIL_H, 4.94, 5.0);
+  B("cladding", 10.9 - 0.22, 13.9 + 0.22, F + 7 + 0.22, F + CEIL_H, 4.94, 5.0);
   windowLX(FW, EXT_T, 1.5, 6.0, 3, 7, { curtainD: 6.1 });
   doorFrameLX(FW, EXT_T, 10.9, 13.9, 7);
   // main door: animated leaf (hinge on the lx = 10.9 side, swings into the hall)
@@ -503,10 +549,9 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   }
   solid(0.375, 10.0, 0, 0.7);
   solid(14.45, 15, -0.05, 0.3);
-  // potted plants beside the door
-  Cy("pot", 9.4, 4.2, F, F + 1.3, 0.42, 0.32);
-  S("leaf", 9.4, F + 2.1, 4.2, 0.7, 1.2);
-  solid(8.9, 9.9, 3.7, 4.7);
+  // potted plant beside the door
+  place("plant", 9.2, 4.0, FL_OUT, 0, -1, [1.6, 1.6, 2.4]);
+  solid(8.4, 10.0, 3.2, 4.8);
   // front steps (3 risers)
   for (let s = 0; s < 3; s++) {
     const top = (F / 3) * (s + 1);
@@ -514,7 +559,7 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
     B("step", 10.2, 14.4, 0, top, d1, 0);
   }
   // bike / scooter in the front setback
-  if (!skip.has("scooter")) {
+  {
     const sd = -1.55;
     CdL("tyre", 2.4, 0.55, sd - 0.2, sd + 0.2, 0.55);
     CdL("tyre", 6.4, 0.55, sd - 0.2, sd + 0.2, 0.55);
@@ -524,15 +569,12 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
     CdL("steel", 6.4, 3.8, sd - 1.0, sd + 1.0, 0.05);
     B("blackMetal", 6.25, 6.55, 3.3, 3.8, sd - 0.12, sd + 0.12);
   }
-  anchor("scooter", 4.4, -1.55, 0, 1);
   solid(1.8, 7.0, -2.2, -0.9);
 
   /* ---------------- Partition A (living | bath, dining, kitchen) ---------------- */
   const PA = 15.9375;
   wallLX(PA, INT_T, 0.375, 14.625, [{ a: 5.5, b: 12.0, sill: 0, head: 8 }], "wall", "wall");
-  B("wood", 5.28, 5.5, F, F + 8.2, PA - 0.25, PA + 0.25);
-  B("wood", 12.0, 12.22, F, F + 8.2, PA - 0.25, PA + 0.25);
-  B("wood", 5.28, 12.22, F + 8, F + 8.2, PA - 0.25, PA + 0.25);
+  doorFrameLX(PA, INT_T, 5.5, 12.0, 8);
 
   /* ---------------- Bath wall (lx = 5.0625) ---------------- */
   const BW = 5.0625;
@@ -564,54 +606,27 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   solid(12.25, 12.4, 31.75, 34.05);
 
   /* ---------------- Living hall ---------------- */
-  if (!skip.has("sofa")) {
-    // L-shaped sofa: long run on the left wall, short run on partition A
-    B("sofa", 0.5, 3.3, F, F + 1.45, 7.3, 15.6);
-    B("sofa", 0.5, 1.25, F + 1.45, F + 2.9, 7.3, 15.6);
-    B("sofa", 3.3, 5.4, F, F + 1.45, 12.7, 15.6);
-    B("sofa", 1.25, 5.4, F + 1.45, F + 2.9, 14.85, 15.6);
-    B("sofa", 0.5, 3.3, F, F + 2.1, 7.3, 7.85); // arm
-    B("sofa", 5.4, 5.95, F, F + 2.1, 12.7, 15.6); // arm
-    B("linen", 1.3, 3.2, F + 1.45, F + 1.75, 7.9, 12.6);
-    B("linen", 1.3, 5.35, F + 1.45, F + 1.75, 12.7, 14.8);
-    // cushions
-    B("cushion", 1.25, 1.65, F + 1.75, F + 3.0, 8.3, 9.7);
-    B("cushion", 1.25, 1.65, F + 1.75, F + 3.0, 10.6, 12.0);
-    B("cushion", 2.0, 3.4, F + 1.75, F + 3.0, 14.4, 14.8);
-    B("cushion", 3.9, 5.2, F + 1.75, F + 3.0, 14.4, 14.8);
-  }
-  anchor("sofa", 2.8, 11.5, 1, 0);
-  solid(0.4, 3.3, 7.3, 15.75);
-  solid(0.4, 5.95, 12.7, 15.75);
+  // sofa against the left wall, facing the TV
+  place("sofa", 0.425 + 1.5, 11.0, FL, 1, 0, [7.0, 3.0, 3.0], { align: "back" });
+  solid(0.4, 3.1, 7.9, 14.1);
+  // accent armchair in the corner by partition A, angled toward the TV
+  place("armchair", 4.7, 14.1, FL, 0.8, -0.6, [2.6, 2.8, 3.1]);
+  solid(3.4, 6.0, 12.8, 15.7);
 
   B("rug", 3.6, 10.2, F + 0.03, F + 0.06, 7.8, 13.2);
-  if (!skip.has("coffeeTable")) {
-    B("wood", 5.0, 8.0, F + 1.25, F + 1.45, 9.0, 11.6);
-    B("blackMetal", 5.2, 7.8, F + 0.1, F + 1.25, 9.2, 11.4);
-    B("granite", 5.3, 7.7, F + 0.4, F + 0.5, 9.3, 11.3);
-    Cy("pot", 6.0, 10.3, F + 1.45, F + 1.9, 0.2, 0.15);
-    S("leaf", 6.0, F + 2.1, 10.3, 0.28, 0.8);
-  }
-  anchor("coffeeTable", 6.5, 10.3, 1, 0);
-  solid(5.0, 8.0, 9.0, 11.6);
+  place("coffeeTable", 6.4, 11.0, FL_RUG, 1, 0, [3.6, 2.0, 1.4]);
+  solid(5.4, 7.4, 9.2, 12.8);
 
-  if (!skip.has("tvUnit")) {
-    // slatted wood TV wall
-    B("wood", 14.45, 14.625, F, F + 9.2, 8.0, 13.5);
-    for (let s = 8.05; s < 13.45; s += 0.36) B("wood", 14.36, 14.45, F, F + 9.2, s, s + 0.16);
-    B("wood", 13.3, 14.36, F + 0.7, F + 2.0, 8.5, 13.0);
-    B("cabinet", 13.28, 13.3, F + 0.8, F + 1.9, 8.6, 12.9);
-    B("ledStrip", 13.32, 13.4, F + 0.62, F + 0.7, 8.6, 12.9);
-    // mounted TV
-    B("blackMetal", 14.22, 14.36, F + 3.7, F + 5.9, 8.9, 12.7);
-    B("screen", 14.2, 14.22, F + 3.78, F + 5.82, 8.98, 12.62);
-  }
-  anchor("tvUnit", 14.0, 10.75, -1, 0);
-  solid(13.3, 14.625, 8.0, 13.5);
+  // slatted wood TV wall (slats stand proud of the backing panel, no shared faces)
+  B("wood", 14.45, 14.625, F, F + 9.2, 8.0, 13.5);
+  for (let s = 8.05; s < 13.45; s += 0.36) B("wood", 14.36, 14.46, F, F + 9.2, s, s + 0.16);
+  // low TV console on the floor + wall-mounted flat screen
+  place("tvUnit", 14.36 - 0.75, 10.75, FL, -1, 0, [5.2, 1.5, 2.0], { align: "back" });
+  place("flatScreenTv", 14.36 - 0.1, 10.75, F + 3.6, -1, 0, [4.0, 0.2, 2.3], { align: "back", shadow: false });
+  solid(12.8, 14.625, 8.0, 13.5);
   // corner plant
-  Cy("pot", 13.9, 15.0, F, F + 1.6, 0.42, 0.3);
-  S("leaf", 13.9, F + 2.6, 15.0, 0.75, 1.4);
-  solid(13.4, 14.4, 14.5, 15.5);
+  place("plant", 13.3, 14.6, FL, -1, -1, [2.0, 2.0, 3.2]);
+  solid(12.5, 14.6, 13.6, 15.7);
 
   // false ceiling with warm cove
   const fcY1 = F + 9.2;
@@ -627,7 +642,7 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   for (const [lx, d] of [[1.1, 6.5], [7.5, 6.5], [13.9, 6.5], [1.1, 15.0], [7.5, 15.0], [13.9, 15.0]] as const) {
     Cy("downlight", lx, d, fcY1 - 0.02, fcY1, 0.22, 0.22, roof, 14);
   }
-  ctx.fans.push(V(7.5, F + CEIL_H, 10.75));
+  place("ceilingFan", 7.5, 10.75, F + CEIL_H, 0, 1, [4.6, 4.6, 1.7], { vAlign: "top", spin: true });
 
   /* ---------------- Bathroom ---------------- */
   const tileT = 0.03;
@@ -638,23 +653,13 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   B("bathWall", 4.875 - tileT, 4.875, F, F + CEIL_H, 20.0, 21.625);
   B("bathWall", 4.875 - tileT, 4.875, F + 7.2, F + CEIL_H, 17.7, 20.0);
   // vanity + backlit mirror
-  B("wood", 0.6, 2.6, F + 1.0, F + 2.6, 16.16, 17.6);
-  B("porcelain", 0.55, 2.65, F + 2.6, F + 2.75, 16.16, 17.65);
-  Cy("porcelain", 1.6, 16.95, F + 2.75, F + 3.1, 0.5, 0.38);
-  Cy("steel", 1.6, 16.35, F + 2.75, F + 3.4, 0.05);
-  CdL("steel", 1.6, F + 3.36, 16.35, 16.75, 0.04);
+  place("vanitySink", 1.6, 16.155 + 0.75, FL_BATH, 0, 1, [2.1, 1.5, 3.4], { align: "back" });
   B("mirrorLight", 0.7, 2.5, F + 3.9, F + 6.2, 16.16, 16.175);
   B("mirror", 0.8, 2.4, F + 4.0, F + 6.1, 16.175, 16.2);
   solid(0.4, 2.65, 16.1, 17.65);
   // western toilet
-  if (!skip.has("toilet")) {
-    B("porcelain", 3.3, 4.5, F + 1.3, F + 2.7, 21.0, 21.6);
-    Cy("porcelain", 3.9, 20.45, F, F + 1.3, 0.5, 0.36);
-    Cy("porcelain", 3.9, 20.45, F + 1.3, F + 1.38, 0.53, 0.53);
-    B("steel", 3.75, 4.05, F + 2.7, F + 2.73, 21.2, 21.4);
-  }
-  anchor("toilet", 3.9, 20.6, 0, -1);
-  solid(3.35, 4.5, 19.9, 21.6);
+  place("toilet", 3.9, 21.595 - 1.15, FL_BATH, 0, -1, [1.3, 2.3, 2.6], { align: "back" });
+  solid(3.25, 4.55, 19.3, 21.6);
   // glass shower partition + overhead shower
   B("porcelain", 0.405, 2.85, F + 0.05, F + 0.14, 19.5, 21.595);
   B("glass", 2.85, 2.9, F + 0.15, F + 6.6, 19.5, 21.595);
@@ -686,62 +691,30 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   B("frame", 13.38, 13.4, F + 5.05, F + 7.55, 24.6, 24.63);
   B("ledStrip", 13.42, 13.55, F + 4.96, F + 5.0, 16.2, 19.3);
   B("ledStrip", 13.42, 13.55, F + 4.96, F + 5.0, 22.2, 27.0);
-  // 3-burner hob + chimney
-  B("hob", 12.8, 14.4, F + 2.9, F + 2.94, 19.6, 21.9);
-  for (const bd of [20.0, 20.75, 21.5]) {
-    Cy("blackMetal", 13.6, bd, F + 2.94, F + 2.99, 0.28, 0.28, main, 16);
-    Cy("steel", 13.6, bd, F + 2.99, F + 3.02, 0.12, 0.12, main, 12);
-  }
-  B("steel", 13.2, 14.595, F + 5.7, F + 6.1, 19.4, 22.1);
-  B("hob", 13.2, 13.25, F + 5.6, F + 6.1, 19.4, 22.1);
-  B("steel", 13.75, 14.5, F + 6.1, F + CEIL_H, 20.3, 21.2);
+  // 3-burner hob on the granite + chimney hood up to the ceiling
+  place("stove", 13.6, 20.75, F + 2.9, -1, 0, [2.3, 1.7, 0.14], { shadow: false });
+  place("chimney", 14.595 - 0.8, 20.75, F + 5.6, -1, 0, [2.8, 1.6, 4.4], { align: "back", shadow: false });
   // sink + faucet (on the shared plumbing wall)
   B("steel", 12.85, 14.25, F + 2.9, F + 2.93, 23.2, 24.8);
   B("blackMetal", 13.0, 14.1, F + 2.905, F + 2.935, 23.35, 24.65);
   Cy("steel", 14.35, 24.0, F + 2.9, F + 3.95, 0.06);
   CxL("steel", 13.7, 14.35, F + 3.9, 24.0, 0.045);
   // refrigerator
-  if (!skip.has("fridge")) {
-    B("appliance", 12.45, 14.55, F, F + 6.2, 27.3, 29.6);
-    B("frame", 12.43, 12.45, F + 3.9, F + 3.93, 27.3, 29.6);
-    B("steel", 12.36, 12.43, F + 2.6, F + 3.7, 27.45, 27.55);
-    B("steel", 12.36, 12.43, F + 4.2, F + 5.6, 27.45, 27.55);
-  }
-  anchor("fridge", 13.5, 28.45, -1, 0);
+  place("fridge", 14.625 - 1.05, 28.45, FL, -1, 0, [2.3, 2.1, 6.2], { align: "back" });
   solid(12.5, 14.625, 16.125, 27.0);
   solid(10.85, 12.625, 16.125, 18.2);
   solid(12.45, 14.625, 27.3, 29.6);
 
   /* ---------------- Bedroom ---------------- */
-  if (!skip.has("wardrobe")) {
-    B("wood", 0.375, 5.3, F, F + CEIL_H, 22.0, 23.92);
-    B("cabinet", 0.45, 2.84, F + 0.2, F + 9.8, 23.92, 23.98);
-    B("cabinet", 2.86, 5.25, F + 0.2, F + 9.8, 23.98, 24.04);
-    B("steel", 2.6, 2.66, F + 3.5, F + 6.5, 23.98, 24.02);
-    B("steel", 3.05, 3.11, F + 3.5, F + 6.5, 24.04, 24.08);
-  }
-  anchor("wardrobe", 2.8, 23.0, 0, 1);
+  place("wardrobe", 2.84, 22.0 + 0.975, FL, 0, 1, [4.9, 1.95, 9.6], { align: "back" });
   solid(0.375, 5.3, 22.0, 24.05);
-  if (!skip.has("bed")) {
-    B("wood", 2.0, 7.0, F, F + 4.2, 30.6, 31.0);
-    B("sofa", 2.3, 6.7, F + 1.9, F + 4.0, 30.5, 30.6);
-    B("wood", 2.0, 7.0, F + 0.3, F + 1.3, 24.4, 30.6);
-    B("blackMetal", 2.2, 6.8, F, F + 0.3, 24.6, 30.4);
-    B("linen", 2.1, 6.9, F + 1.3, F + 2.0, 24.5, 30.5);
-    B("blanket", 2.05, 6.95, F + 1.95, F + 2.15, 24.45, 28.4);
-    B("linen", 2.5, 4.35, F + 2.0, F + 2.45, 29.3, 30.35);
-    B("linen", 4.65, 6.5, F + 2.0, F + 2.45, 29.3, 30.35);
-    B("cushion", 3.4, 5.6, F + 2.1, F + 2.6, 28.8, 29.25);
-  }
-  anchor("bed", 4.5, 27.5, 0, -1);
+  place("queenBed", 4.5, 31.0 - 3.3, FL, 0, -1, [5.0, 6.6, 4.0], { align: "back" });
   solid(2.0, 7.0, 24.4, 31.0);
-  // bedside tables + glowing lamps
+  // bedside tables (top at 1.5 ft) + glowing lamps
   for (const tx of [1.175, 7.825]) {
-    B("wood", tx - 0.68, tx + 0.68, F, F + 1.8, 29.5, 30.9);
-    B("frame", tx - 0.6, tx + 0.6, F + 1.0, F + 1.03, 29.48, 29.5);
-    Cy("wood", tx, 30.2, F + 1.8, F + 2.5, 0.12, 0.16);
-    Cy("lampShade", tx, 30.2, F + 2.5, F + 3.25, 0.34, 0.45);
-    solid(tx - 0.68, tx + 0.68, 29.5, 30.9);
+    place("nightstand", tx, 31.0 - 0.75, FL, 0, -1, [1.5, 1.5, 1.6], { align: "back" });
+    place("lamp", tx, 30.4, FL + 1.5, 0, -1, [0.9, 0.9, 1.6], { shadow: false });
+    solid(tx - 0.75, tx + 0.75, 29.5, 30.9);
   }
   // dressing mirror on the divider wall
   B("wood", 9.56, 9.625, F + 1.1, F + 6.7, 25.2, 27.0);
@@ -750,13 +723,7 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   for (const [lx, d] of [[4.6, 25.2], [4.6, 29.0], [8.4, 27.0]] as const) Cy("downlight", lx, d, F + CEIL_H - 0.03, F + CEIL_H, 0.22, 0.22, roof, 14);
 
   /* ---------------- Utility / wash area ---------------- */
-  if (!skip.has("washingMachine")) {
-    B("porcelain", 12.5, 14.5, F, F + 2.8, 32.4, 34.5);
-    B("frame", 12.5, 14.5, F + 2.4, F + 2.8, 32.38, 32.4);
-    CdL("steel", 13.5, F + 1.35, 32.33, 32.4, 0.6);
-    CdL("screen", 13.5, F + 1.35, 32.3, 32.33, 0.46);
-  }
-  anchor("washingMachine", 13.5, 33.45, 0, -1);
+  place("washingMachine", 13.5, 34.625 - 1.0, FL_OUT, 0, -1, [2.0, 2.0, 2.8], { align: "back" });
   solid(12.45, 14.6, 32.35, 34.6);
   // utility sink
   B("concrete", 1.0, 3.4, F + 2.2, F + 2.9, 33.3, 34.6);
@@ -767,7 +734,9 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
   solid(1.0, 3.4, 33.3, 34.6);
 
   /* ---------------- Ceiling fixtures ---------------- */
-  for (const [lx, d] of [[4.0, 2.5], [11.0, 2.5], [7.6, 18.9], [2.6, 18.9], [11.8, 19.5], [11.6, 24.5], [11.3, 29.8]] as const) {
+  // dining passage pendant
+  place("pendantLamp", 7.6, 18.9, F + CEIL_H, 0, 1, [1.2, 1.2, 2.4], { vAlign: "top" });
+  for (const [lx, d] of [[4.0, 2.5], [11.0, 2.5], [2.6, 18.9], [11.8, 19.5], [11.6, 24.5], [11.3, 29.8]] as const) {
     Cy("downlight", lx, d, F + CEIL_H - 0.03, F + CEIL_H, 0.22, 0.22, roof, 14);
   }
 
@@ -790,11 +759,11 @@ export function buildHouseUnit(i: number, ctx: UnitCtx) {
 /* Whole site                                                          */
 /* ------------------------------------------------------------------ */
 
-export function buildRowHouses(lib: MaterialLibrary, skipList: FurnitureKey[] = []): BuiltScene {
+export function buildRowHouses(lib: MaterialLibrary): BuiltScene {
   const main = new Kit();
   const roof = new Kit();
   const boxes: AABB[] = [];
-  const ctx: UnitCtx = { main, roof, boxes, doors: [], fans: [], anchors: [], lights: [], skip: new Set(skipList) };
+  const ctx: UnitCtx = { main, roof, boxes, doors: [], anchors: [], lights: [] };
   const Z = (d: number) => 17.5 - d;
   const xL = -PLOT_W / 2 - EXT_T / 2;
   const xR = PLOT_W / 2 + EXT_T / 2;
@@ -903,7 +872,6 @@ export function buildRowHouses(lib: MaterialLibrary, skipList: FurnitureKey[] = 
     ground,
     collision,
     doors: ctx.doors,
-    fans: ctx.fans,
     anchors: ctx.anchors,
     lights: ctx.lights,
     dispose: () => {

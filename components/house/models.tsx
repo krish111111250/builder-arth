@@ -1,67 +1,73 @@
 "use client";
 
 /**
- * Optional GLB furniture.
+ * Furniture and fixtures for all 3 houses.
  *
- * To swap a procedural piece for a real model:
- *   1. Put the file in /public/models (Draco-compressed .glb is fine).
- *   2. Add an entry below, e.g.  sofa: { url: "/models/sofa.glb", scale: 1 }
- * The procedural version of that piece is skipped automatically and the model
- * is placed at the same anchor in all 3 houses. In House 2 it is mirrored
- * (negative X scale), so an L-sofa or bed flips with the plan.
- * Models should be in feet (or use `scale`; metres -> feet = 3.281), with the
- * origin at floor level and the front facing +Z.
- *
- * The Draco decoder is served locally from /public/draco (no CDN).
- * Model URLs should also start with process.env.NEXT_PUBLIC_BASE_PATH on GitHub Pages.
+ * Each anchor from buildHouseUnit gets the slot's .glb (if public/models/<key>.glb
+ * exists, see src/config/assetManifest.ts) or the curved procedural fallback.
+ * Either way it goes through fitObject(): scaled into the anchor's box, centred,
+ * flush on the floor, with a soft contact shadow. Loaded models are fetched once
+ * and cloned for each house; House 2 gets a mirrored copy.
  */
-import { Suspense, useMemo } from "react";
-import { useGLTF } from "@react-three/drei";
-import { HOUSES, type FurnitureKey, type ModelAnchor } from "./buildHouseUnit";
+import { Suspense, use, useMemo } from "react";
+import * as THREE from "three";
+import { useFrame } from "@react-three/fiber";
+import { ASSET_MANIFEST, modelUrl } from "../../src/config/assetManifest";
+import { cloneAsset, fitObject, loadModel } from "../../src/utils/modelLoader";
+import { proceduralTemplate } from "./proceduralAssets";
+import type { ModelAnchor } from "./buildHouseUnit";
+import type { MaterialLibrary } from "./textures";
 
-export const DRACO_DECODER_PATH = `${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/draco/`;
-
-export interface ModelConfig {
-  url: string;
-  scale?: number;
-  yOffset?: number;
+function place(src: THREE.Object3D, a: ModelAnchor, fromFile: boolean) {
+  return fitObject(fromFile ? cloneAsset(src) : src.clone(), {
+    width: a.size[0],
+    depth: a.size[1],
+    height: a.size[2],
+    position: a.position,
+    rotationY: a.rotationY,
+    mirror: a.mirror,
+    align: a.align,
+    vAlign: a.vAlign,
+    rotationOffset: fromFile ? ASSET_MANIFEST[a.key].rotationOffset : 0,
+    contactShadow: a.contactShadow,
+  }).object;
 }
 
-export const FURNITURE_MODELS: Partial<Record<FurnitureKey, ModelConfig>> = {
-  // sofa: { url: "/models/sofa.glb", scale: 3.281 },
-  // bed: { url: "/models/queen-bed.glb", scale: 3.281 },
-};
+function Spinner({ object }: { object: THREE.Object3D }) {
+  useFrame((_, dt) => {
+    object.rotation.y += Math.min(dt, 0.05) * 5;
+  });
+  return null;
+}
 
-export const MODEL_KEYS = Object.keys(FURNITURE_MODELS) as FurnitureKey[];
-
-function GlbModel({ cfg, anchor }: { cfg: ModelConfig; anchor: ModelAnchor }) {
-  const { scene } = useGLTF(cfg.url, DRACO_DECODER_PATH);
-  const clone = useMemo(() => {
-    const c = scene.clone(true);
-    c.traverse((o) => {
-      o.castShadow = true;
-      o.receiveShadow = true;
-    });
-    return c;
-  }, [scene]);
+function AssetInstance({ anchor, lib, loader }: { anchor: ModelAnchor; lib: MaterialLibrary; loader: Promise<THREE.Object3D | null> | null }) {
+  const loaded = loader ? use(loader) : null;
+  const obj = useMemo(() => {
+    const src = loaded ?? proceduralTemplate(anchor.key, lib);
+    return src ? place(src, anchor, !!loaded) : null;
+  }, [loaded, anchor, lib]);
+  if (!obj) return null;
+  // the model is centred on its anchor, so spinning the outer group turns a fan on its own axis
   return (
-    <primitive
-      object={clone}
-      position={[anchor.position.x, anchor.position.y + (cfg.yOffset ?? 0), anchor.position.z]}
-      rotation={[0, anchor.rotationY, 0]}
-      scale={[(HOUSES[anchor.house].mirror ? -1 : 1) * (cfg.scale ?? 1), cfg.scale ?? 1, cfg.scale ?? 1]}
-    />
+    <>
+      <primitive object={obj} />
+      {anchor.spin && <Spinner object={obj} />}
+    </>
   );
 }
 
-export function FurnitureModels({ anchors }: { anchors: ModelAnchor[] }) {
-  if (MODEL_KEYS.length === 0) return null;
+export function FurnitureModels({ anchors, lib, roofVisible }: { anchors: ModelAnchor[]; lib: MaterialLibrary; roofVisible: boolean }) {
   return (
-    <Suspense fallback={null}>
-      {anchors.map((a) => {
-        const cfg = FURNITURE_MODELS[a.key];
-        return cfg ? <GlbModel key={`${a.house}-${a.key}`} cfg={cfg} anchor={a} /> : null;
+    <>
+      {anchors.map((a, i) => {
+        if (a.hideWithRoof && !roofVisible) return null;
+        const url = modelUrl(a.key);
+        return (
+          <Suspense key={`${a.house}-${a.key}-${i}`} fallback={null}>
+            <AssetInstance anchor={a} lib={lib} loader={url ? loadModel(url) : null} />
+          </Suspense>
+        );
       })}
-    </Suspense>
+    </>
   );
 }
